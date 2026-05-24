@@ -1,0 +1,13 @@
+.env
+*.session
+*.session-journal
+__pycache__/
+*.pyc
+*.pyo
+datavortex.db
+*.db
+*.sqlite
+.venv/
+venv/
+_downloads/
+.DS_Store
