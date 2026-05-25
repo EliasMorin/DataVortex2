@@ -21,6 +21,7 @@ from rich.progress import (
 )
 
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.tl.types import (
     Channel, Chat,
     MessageMediaDocument,
@@ -190,7 +191,19 @@ async def fetch_channels(client: TelegramClient) -> list[dict]:
 
 
 DOWNLOAD_WORKERS  = int(os.environ.get("DOWNLOAD_WORKERS", "4"))
-DOWNLOAD_CHUNK_KB = int(os.environ.get("DOWNLOAD_CHUNK_KB", "512"))
+DOWNLOAD_CHUNK_KB = int(os.environ.get("DOWNLOAD_CHUNK_KB", "1024"))
+
+
+def _build_string_session(client: TelegramClient) -> str:
+    """Exporte la session courante en StringSession (auth_key DC principal)."""
+    ss = StringSession()
+    ss.set_dc(
+        client.session.dc_id,
+        client.session.server_address,
+        client.session.port,
+    )
+    ss.auth_key = client.session.auth_key
+    return ss.save()
 
 
 async def _parallel_download(
@@ -201,26 +214,40 @@ async def _parallel_download(
     chunk_size: int = DOWNLOAD_CHUNK_KB * 1024,
     progress_cb=None,
 ) -> None:
-    """Téléchargement parallèle via iter_download + stride pour maximiser le débit."""
-    size   = message.document.size
-    stride = workers * chunk_size
+    """
+    Téléchargement parallèle via N connexions MTProto indépendantes.
+    Chaque worker ouvre son propre TelegramClient (TCP distinct) et
+    télécharge ses chunks en interleave (stride), puis se déconnecte.
+    """
+    size       = message.document.size
+    stride     = workers * chunk_size
     downloaded = 0
-    lock = asyncio.Lock()
+    lock       = asyncio.Lock()
 
     # Pré-alloue le fichier sur disque
     with open(path, "wb") as _fh:
         _fh.truncate(size)
 
+    session_str = _build_string_session(client)
     fh = open(path, "r+b")
+    sub_clients: list[TelegramClient] = []
+
     try:
+        # Ouvre N connexions TCP indépendantes
+        for _ in range(workers):
+            sub = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+            await sub.connect()
+            sub_clients.append(sub)
+
         async def _worker(wid: int) -> None:
             nonlocal downloaded
             pos = wid * chunk_size
-            async for chunk in client.iter_download(
+            async for chunk in sub_clients[wid].iter_download(
                 message,
                 offset=wid * chunk_size,
                 stride=stride,
                 chunk_size=chunk_size,
+                request_size=chunk_size,
                 file_size=size,
             ):
                 async with lock:
@@ -234,6 +261,11 @@ async def _parallel_download(
         await asyncio.gather(*[_worker(i) for i in range(workers)])
     finally:
         fh.close()
+        for sub in sub_clients:
+            try:
+                await sub.disconnect()
+            except Exception:
+                pass
 
 
 async def scan_channel(
