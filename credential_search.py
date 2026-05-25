@@ -37,7 +37,41 @@ _PASSWORD_FILENAMES: frozenset[str] = frozenset({
     "logins.txt",
     "login.txt",
     "credentials.txt",
+    # variantes sans extension ou avec espaces
+    "all passwords",
+    "all_passwords",
+    "autofill.txt",
+    "autofills.txt",
 })
+
+
+def _decode_content(data: bytes) -> str:
+    """
+    Détecte l'encodage du fichier et décode correctement.
+    Ordre : UTF-16 BOM → UTF-16 LE sans BOM (heuristique) → UTF-8 → latin-1.
+    """
+    # BOM UTF-16 explicite
+    if data[:2] in (b'\xff\xfe', b'\xfe\xff'):
+        return data.decode("utf-16", errors="replace")
+    # BOM UTF-8
+    if data[:3] == b'\xef\xbb\xbf':
+        return data.decode("utf-8-sig", errors="replace")
+    # Heuristique UTF-16 LE sans BOM :
+    # si > 30 % des bytes pairs sont nuls, c'est très probablement UTF-16 LE
+    if len(data) >= 8:
+        null_even = sum(1 for i in range(0, min(len(data), 200), 2) if data[i + 1] == 0)
+        if null_even / (min(len(data), 200) // 2) > 0.30:
+            try:
+                return data.decode("utf-16-le", errors="replace")
+            except Exception:
+                pass
+    # UTF-8 strict
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    # Fallback universel
+    return data.decode("latin-1", errors="replace")
 
 
 def _is_password_file(member_name: str) -> bool:
@@ -133,22 +167,30 @@ def _filter_entries(
 
 # ── Extraction ZIP ────────────────────────────────────────────────────────────
 
-def _search_zip(path: str, targets: list[str]) -> list[dict]:
+def _search_zip(path: str, targets: list[str]) -> tuple[list[dict], str]:
+    """Retourne (results, fallback_text) où fallback_text est le texte brut des
+    fichiers passwords qui n'ont produit aucun match (pour le fallback Groq)."""
     results: list[dict] = []
+    fallback_parts: list[str] = []
     try:
         with zipfile.ZipFile(path, "r") as zf:
             pw_members = [n for n in zf.namelist() if _is_password_file(n)]
             for member in pw_members:
                 try:
                     data    = zf.read(member)
-                    text    = data.decode("utf-8", errors="replace")
+                    text    = _decode_content(data)
                     entries = parse_password_file(text)
-                    results.extend(_filter_entries(entries, targets, member))
+                    found   = _filter_entries(entries, targets, member)
+                    if found:
+                        results.extend(found)
+                    elif text.strip():
+                        # Pas de match standard → garder pour Groq
+                        fallback_parts.append(f"# {member}\n{text[:2000]}")
                 except Exception:
                     continue
     except Exception:
         pass
-    return results
+    return results, "\n\n".join(fallback_parts[:3])  # max 3 fichiers envoyés à Groq
 
 
 # ── Extraction RAR ────────────────────────────────────────────────────────────
@@ -175,13 +217,13 @@ def _configure_rarfile() -> bool:
     return False
 
 
-def _search_rar(path: str, targets: list[str]) -> list[dict]:
+def _search_rar(path: str, targets: list[str]) -> tuple[list[dict], str]:
     """
     Extrait et parse les fichiers password depuis un RAR.
-    Utilise rarfile.extractall() pour n'extraire que les fichiers cibles
-    (efficace même sur des archives de plusieurs Go).
+    Retourne (results, fallback_text).
     """
     results: list[dict] = []
+    fallback_parts: list[str] = []
     try:
         import rarfile as _rf
     except ImportError:
@@ -189,14 +231,14 @@ def _search_rar(path: str, targets: list[str]) -> list[dict]:
 
     if not _configure_rarfile():
         # Pas d'outil d'extraction disponible → listing seul, pas de lecture
-        return results
+        return results, ""
 
     tmp_dir = tempfile.mkdtemp(prefix="dv_creds_")
     try:
         with _rf.RarFile(path, "r") as rf:
             pw_members = [n for n in rf.namelist() if _is_password_file(n)]
             if not pw_members:
-                return results
+                return results, ""
             # Extraction ciblée : uniquement les fichiers passwords
             rf.extractall(tmp_dir, members=pw_members)
 
@@ -207,11 +249,16 @@ def _search_rar(path: str, targets: list[str]) -> list[dict]:
                     continue
                 fpath = os.path.join(root, fname)
                 try:
-                    with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
-                        text = fh.read()
+                    with open(fpath, "rb") as fh:
+                        raw = fh.read()
+                    text = _decode_content(raw)
                     rel  = os.path.relpath(fpath, tmp_dir)
                     entries = parse_password_file(text)
-                    results.extend(_filter_entries(entries, targets, rel))
+                    found   = _filter_entries(entries, targets, rel)
+                    if found:
+                        results.extend(found)
+                    elif text.strip():
+                        fallback_parts.append(f"# {rel}\n{text[:2000]}")
                 except Exception:
                     continue
     except Exception:
@@ -219,29 +266,48 @@ def _search_rar(path: str, targets: list[str]) -> list[dict]:
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    return results
+    return results, "\n\n".join(fallback_parts[:3])
 
 
 # ── Point d'entrée public ─────────────────────────────────────────────────────
 
-def search_credentials(
+async def search_credentials(
     path: str, filename: str, targets: list[str]
 ) -> list[dict]:
     """
     Recherche les credentials correspondant aux domaines `targets` dans une
     archive locale `path`.
 
-    Retourne une liste de dicts :
-        { host, login, password, soft, file_path }
+    1. Tente le parseur standard (regex + détection d'encodage).
+    2. Si 0 résultat mais des fichiers passwords ont été trouvés,
+       utilise Groq comme fallback pour identifier le format et extraire.
 
-    Retourne [] si `targets` est vide, si l'archive ne contient aucun fichier
-    password reconnu, ou si aucune entrée ne correspond.
+    Retourne une liste de dicts : { host, login, password, soft, file_path }
     """
     if not targets:
         return []
+
     ext = os.path.splitext(filename.lower())[1]
     if ext == ".zip":
-        return _search_zip(path, targets)
-    if ext == ".rar":
-        return _search_rar(path, targets)
+        results, fallback_text = _search_zip(path, targets)
+    elif ext == ".rar":
+        results, fallback_text = _search_rar(path, targets)
+    else:
+        return []
+
+    if results:
+        return results
+
+    # Fallback Groq : parseur standard n'a rien trouvé mais il y avait du contenu
+    if fallback_text.strip():
+        try:
+            from groq_utils import ask_groq_credentials, key_available
+            if key_available():
+                groq_results = await ask_groq_credentials(fallback_text, targets)
+                for r in groq_results:
+                    r.setdefault("file_path", "groq_fallback")
+                return groq_results
+        except Exception:
+            pass
+
     return []

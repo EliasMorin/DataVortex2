@@ -351,7 +351,7 @@ async def scan_channel(
                         console.print(f"      [{C_DIM}]🤖 Groq: aucune structure identifiée[/]")
             # ── Recherche de credentials ciblés (fichiers passwords) ─────────
             if CREDENTIAL_TARGETS and file_list is not None:
-                creds_found = search_credentials(temp_path, filename, CREDENTIAL_TARGETS)
+                creds_found = await search_credentials(temp_path, filename, CREDENTIAL_TARGETS)
                 if creds_found:
                     console.print(
                         f"      [{C_PASSWORD}]🔑 {len(creds_found)} credential(s) trouvé(s) :[/]"

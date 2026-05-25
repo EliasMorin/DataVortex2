@@ -153,3 +153,62 @@ async def ask_groq_password(msg_text: str) -> str | None:
     if not pwd or str(pwd).strip().lower() in ("null", "none", ""):
         return None
     return str(pwd).strip()
+
+
+# ── Extraction de credentials ciblés (fallback IA) ───────────────────────────
+
+async def ask_groq_credentials(
+    file_sample: str, targets: list[str]
+) -> list[dict]:
+    """
+    Fallback IA : quand le parseur standard ne trouve rien, envoie un
+    échantillon du fichier à Groq pour extraire les credentials correspondant
+    aux domaines cibles, quel que soit le format du fichier.
+
+    Retourne une liste de dicts {host, login, password, soft}.
+    """
+    if not key_available() or not file_sample.strip() or not targets:
+        return []
+
+    targets_str = ", ".join(targets)
+    # Limite l'envoi à 3000 chars pour rester dans les tokens
+    sample = file_sample[:3000]
+
+    prompt = (
+        "Tu analyses un fichier de credentials volés (stealer log).\n"
+        f"Extrait UNIQUEMENT les entrées dont l'URL ou le host contient l'un de ces domaines : {targets_str}\n"
+        "Le fichier peut avoir n'importe quel format (blocs, CSV, JSON, liste, etc.).\n\n"
+        f"Contenu du fichier :\n{sample}\n\n"
+        "Réponds UNIQUEMENT en JSON valide :\n"
+        '{"credentials":[{"host":"https://...","login":"user@email.com","password":"pass","soft":"Chrome"}]}\n'
+        'Si aucune entrée correspondante : {"credentials":[]}'
+    )
+
+    payload: dict[str, Any] = {
+        "model":           GROQ_MODEL,
+        "messages":        [{"role": "user", "content": prompt}],
+        "temperature":     0.0,
+        "max_tokens":      1024,
+        "response_format": {"type": "json_object"},
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(GROQ_API_URL, headers=_headers(), json=payload)
+            resp.raise_for_status()
+        data = json.loads(resp.json()["choices"][0]["message"]["content"])
+    except Exception:
+        return []
+
+    results = []
+    for entry in data.get("credentials") or []:
+        host = str(entry.get("host", "")).strip()
+        if not host:
+            continue
+        results.append({
+            "host":     host,
+            "login":    str(entry.get("login", "")).strip(),
+            "password": str(entry.get("password", "")).strip(),
+            "soft":     str(entry.get("soft", "")).strip(),
+        })
+    return results
