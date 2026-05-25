@@ -189,6 +189,53 @@ async def fetch_channels(client: TelegramClient) -> list[dict]:
     return channels
 
 
+DOWNLOAD_WORKERS  = int(os.environ.get("DOWNLOAD_WORKERS", "4"))
+DOWNLOAD_CHUNK_KB = int(os.environ.get("DOWNLOAD_CHUNK_KB", "512"))
+
+
+async def _parallel_download(
+    client: TelegramClient,
+    message,
+    path: str,
+    workers: int = DOWNLOAD_WORKERS,
+    chunk_size: int = DOWNLOAD_CHUNK_KB * 1024,
+    progress_cb=None,
+) -> None:
+    """Téléchargement parallèle via iter_download + stride pour maximiser le débit."""
+    size   = message.document.size
+    stride = workers * chunk_size
+    downloaded = 0
+    lock = asyncio.Lock()
+
+    # Pré-alloue le fichier sur disque
+    with open(path, "wb") as _fh:
+        _fh.truncate(size)
+
+    fh = open(path, "r+b")
+    try:
+        async def _worker(wid: int) -> None:
+            nonlocal downloaded
+            pos = wid * chunk_size
+            async for chunk in client.iter_download(
+                message,
+                offset=wid * chunk_size,
+                stride=stride,
+                chunk_size=chunk_size,
+                file_size=size,
+            ):
+                async with lock:
+                    fh.seek(pos)
+                    fh.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_cb:
+                        progress_cb(min(downloaded, size), size)
+                pos += stride
+
+        await asyncio.gather(*[_worker(i) for i in range(workers)])
+    finally:
+        fh.close()
+
+
 async def scan_channel(
     client: TelegramClient,
     channel_id: int,
@@ -251,7 +298,7 @@ async def scan_channel(
                 _task = _prog.add_task("", total=doc.size or None)
                 def _dl_cb(current, total, _t=_task, _p=_prog):
                     _p.update(_t, completed=current)
-                await client.download_media(message, file=temp_path, progress_callback=_dl_cb)
+                await _parallel_download(client, message, temp_path, progress_cb=_dl_cb)
         except Exception as exc:
             console.print(f"      [{C_DIM}]⚠ Téléchargement échoué : {exc}[/]")
             try:
