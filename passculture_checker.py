@@ -92,6 +92,32 @@ class CheckResult:
 _LOGIN_PAGE = "https://passculture.app/connexion"
 
 
+def _get_google_cookies() -> list[dict]:
+    """
+    Extrait les cookies Google depuis le Chrome local (macOS/Windows/Linux).
+    Ces cookies améliorent le score reCAPTCHA v2 (utilisateur reconnu par Google).
+    Retourne [] si non disponible (silencieux).
+    """
+    try:
+        import browser_cookie3
+        jar = browser_cookie3.chrome(domain_name=".google.com")
+        cookies = []
+        for c in jar:
+            domain = c.domain if c.domain.startswith(".") else f".{c.domain}"
+            cookies.append({
+                "name":     c.name,
+                "value":    c.value,
+                "domain":   domain,
+                "path":     c.path or "/",
+                "secure":   bool(c.secure),
+                "httpOnly": False,
+                "sameSite": "Lax",
+            })
+        return cookies
+    except Exception:
+        return []
+
+
 async def _find_bframe(page: Any) -> Any:
     """Retourne la frame reCAPTCHA bframe, ou None."""
     for _ in range(20):
@@ -125,6 +151,13 @@ async def _solve_recaptcha_audio(page: Any) -> bool:
             print(f"[CAPTCHA] bframe found: {bframe.url[:80]}")
 
         await page.wait_for_timeout(1500)
+
+        # ── Détecter doscaptcha AVANT de cliquer le bouton audio ─────────────
+        early_html = await bframe.evaluate("document.body.innerHTML")
+        if "rc-doscaptcha" in early_html:
+            if DEBUG:
+                print("[CAPTCHA] doscaptcha immédiat — IP rate-limited par Google")
+            return False
 
         # ── Cliquer le bouton audio (peut recharger la bframe) ────────────────
         audio_btn_selectors = [
@@ -290,6 +323,13 @@ async def _signin_playwright(email: str, password: str) -> dict[str, Any]:
                 print(f"[DEBUG] Routing browser traffic through proxy: {PROXY}")
         context = await browser.new_context(**ctx_kwargs)
         page = await context.new_page()
+
+        # ── Injecter les cookies Google pour améliorer le score reCAPTCHA ─────
+        google_cookies = _get_google_cookies()
+        if google_cookies:
+            await context.add_cookies(google_cookies)
+            if DEBUG:
+                print(f"[DEBUG] Injected {len(google_cookies)} Google cookies → better reCAPTCHA score")
 
         try:
             # Ajuster les timeouts selon la vitesse réseau
