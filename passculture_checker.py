@@ -56,6 +56,7 @@ MAX_CONCURRENT   = int(os.environ.get("PC_CONCURRENT", "3"))
 DEBUG   = False  # activé via --debug
 VISIBLE = False  # activé via --visible (affiche le navigateur)
 USE_TOR = False  # activé via --tor (proxy SOCKS5 Tor sur localhost:9050)
+PROXY   = ""     # proxy custom via --proxy (ex: socks5://host:port ou http://host:port)
 
 # ── Types de résultat ─────────────────────────────────────────────────────────
 
@@ -283,6 +284,10 @@ async def _signin_playwright(email: str, password: str) -> dict[str, Any]:
             ctx_kwargs["proxy"] = {"server": "socks5://127.0.0.1:9050"}
             if DEBUG:
                 print("[DEBUG] Routing browser traffic through Tor (socks5://127.0.0.1:9050)")
+        elif PROXY:
+            ctx_kwargs["proxy"] = {"server": PROXY}
+            if DEBUG:
+                print(f"[DEBUG] Routing browser traffic through proxy: {PROXY}")
         context = await browser.new_context(**ctx_kwargs)
         page = await context.new_page()
 
@@ -304,7 +309,15 @@ async def _signin_playwright(email: str, password: str) -> dict[str, Any]:
                 await page.wait_for_timeout(300)
 
             await page.goto(_LOGIN_PAGE, wait_until="domcontentloaded", timeout=nav_timeout)
-            await page.wait_for_timeout(1000)
+            await page.wait_for_timeout(2000)
+
+            if DEBUG:
+                title = await page.title()
+                url   = page.url
+                print(f"[DEBUG] Page loaded — title={title!r}  url={url}")
+                # Détecte Cloudflare challenge
+                body_txt = await page.evaluate("document.body?.innerText?.slice(0,300) || ''")
+                print(f"[DEBUG] Body preview: {body_txt!r}")
 
             # Bannière cookies
             try:
@@ -611,7 +624,7 @@ async def run(pairs: list[tuple[str, str]], export_path: str | None = None) -> N
 
 
 def main() -> None:
-    global DEBUG, VISIBLE, USE_TOR, RATE_LIMIT_DELAY, MAX_CONCURRENT
+    global DEBUG, VISIBLE, USE_TOR, PROXY, RATE_LIMIT_DELAY, MAX_CONCURRENT
 
     parser = argparse.ArgumentParser(
         description="Vérifie des credentials Pass Culture via l'API native."
@@ -628,11 +641,13 @@ def main() -> None:
     parser.add_argument("--debug",   action="store_true", help="Affiche les requêtes/réponses brutes HTTP")
     parser.add_argument("--visible", action="store_true", help="Affiche le navigateur (utile si reCAPTCHA bloque)")
     parser.add_argument("--tor",     action="store_true", help="Route le navigateur via Tor socks5://127.0.0.1:9050 (VPS)")
+    parser.add_argument("--proxy",   metavar="URL",       help="Proxy custom (ex: socks5://host:port ou http://host:port)")
     args = parser.parse_args()
 
     DEBUG            = args.debug
     VISIBLE          = args.visible
     USE_TOR          = args.tor
+    PROXY            = args.proxy or ""
     RATE_LIMIT_DELAY = args.delay
     MAX_CONCURRENT   = args.concurrent
 
