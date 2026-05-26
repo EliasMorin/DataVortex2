@@ -94,28 +94,46 @@ _LOGIN_PAGE = "https://passculture.app/connexion"
 
 def _get_google_cookies() -> list[dict]:
     """
-    Extrait les cookies Google depuis le Chrome local (macOS/Windows/Linux).
+    Extrait les cookies Google depuis le navigateur local (Chrome, Firefox, Safari…).
     Ces cookies améliorent le score reCAPTCHA v2 (utilisateur reconnu par Google).
     Retourne [] si non disponible (silencieux).
     """
     try:
         import browser_cookie3
-        jar = browser_cookie3.chrome(domain_name=".google.com")
-        cookies = []
-        for c in jar:
-            domain = c.domain if c.domain.startswith(".") else f".{c.domain}"
-            cookies.append({
-                "name":     c.name,
-                "value":    c.value,
-                "domain":   domain,
-                "path":     c.path or "/",
-                "secure":   bool(c.secure),
-                "httpOnly": False,
-                "sameSite": "Lax",
-            })
-        return cookies
-    except Exception:
+    except ImportError:
         return []
+
+    browsers = [
+        ("chrome",  lambda: browser_cookie3.chrome(domain_name=".google.com")),
+        ("firefox", lambda: browser_cookie3.firefox(domain_name=".google.com")),
+        ("safari",  lambda: browser_cookie3.safari(domain_name=".google.com")),
+        ("brave",   lambda: browser_cookie3.brave(domain_name=".google.com")),
+        ("edge",    lambda: browser_cookie3.edge(domain_name=".google.com")),
+    ]
+
+    for name, loader in browsers:
+        try:
+            jar = loader()
+            cookies = []
+            for c in jar:
+                domain = c.domain if c.domain.startswith(".") else f".{c.domain}"
+                cookies.append({
+                    "name":     c.name,
+                    "value":    c.value,
+                    "domain":   domain,
+                    "path":     c.path or "/",
+                    "secure":   bool(c.secure),
+                    "httpOnly": False,
+                    "sameSite": "Lax",
+                })
+            if cookies:
+                if DEBUG:
+                    print(f"[DEBUG] Google cookies source: {name} ({len(cookies)} cookies)")
+                return cookies
+        except Exception:
+            continue
+
+    return []
 
 
 async def _find_bframe(page: Any) -> Any:
