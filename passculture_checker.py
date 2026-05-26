@@ -148,160 +148,128 @@ async def _find_bframe(page: Any) -> Any:
 
 async def _solve_recaptcha_audio(page: Any) -> bool:
     """
-    Bypass reCAPTCHA v2 via le challenge audio + Whisper (local, gratuit).
+    Bypass reCAPTCHA v2 via le challenge audio + faster-whisper.
+    Adapté de github.com/ibedevesh/capsolver.
     Retourne True si résolu, False sinon.
     """
-    import whisper
-    import tempfile, urllib.request, pathlib
+    import os, tempfile, requests as req_sync
+    from faster_whisper import WhisperModel
 
     if DEBUG:
-        print("[CAPTCHA] reCAPTCHA détecté — lancement bypass audio...")
+        print("[CAPTCHA] Résolution audio (faster-whisper beam_size=5)...")
 
     try:
-        # ── Trouver la bframe initiale ────────────────────────────────────────
-        bframe = await _find_bframe(page)
-        if not bframe:
-            if DEBUG:
-                print("[CAPTCHA] bframe introuvable")
-            return False
+        # ── Utiliser frame_locator (plus fiable que page.frames) ─────────────
+        challenge_frame = page.frame_locator("iframe[src*='bframe']").first
 
-        if DEBUG:
-            print(f"[CAPTCHA] bframe found: {bframe.url[:80]}")
-
-        await page.wait_for_timeout(1500)
-
-        # ── Détecter doscaptcha AVANT de cliquer le bouton audio ─────────────
-        early_html = await bframe.evaluate("document.body.innerHTML")
-        if "rc-doscaptcha" in early_html:
-            if DEBUG:
-                print("[CAPTCHA] doscaptcha immédiat — IP rate-limited par Google")
-            return False
-
-        # ── Cliquer le bouton audio (peut recharger la bframe) ────────────────
-        audio_btn_selectors = [
-            "#recaptcha-audio-button",
-            "button#recaptcha-audio-button",
-            "button[aria-label*='audio']",
-            "button[title*='audio']",
-        ]
-        for sel in audio_btn_selectors:
-            try:
-                await bframe.click(sel, timeout=3000)
+        # ── Vérifier doscaptcha AVANT de cliquer audio ────────────────────────
+        try:
+            dos = page.frame_locator("iframe[src*='bframe']").first.locator(".rc-doscaptcha-body")
+            if await dos.is_visible(timeout=2000):
                 if DEBUG:
-                    print(f"[CAPTCHA] Audio button clicked via {sel!r}")
-                break
-            except Exception:
-                pass
+                    print("[CAPTCHA] doscaptcha détecté — IP rate-limited")
+                return False
+        except Exception:
+            pass
 
-        # ── Re-trouver la bframe après rechargement ───────────────────────────
+        # ── Cliquer le bouton audio ───────────────────────────────────────────
+        try:
+            await challenge_frame.locator("#recaptcha-audio-button").click(timeout=5000)
+            if DEBUG:
+                print("[CAPTCHA] Audio button clicked")
+        except Exception as e:
+            if DEBUG:
+                print(f"[CAPTCHA] Audio button click failed: {e}")
+            return False
+
         await page.wait_for_timeout(2000)
-        bframe = await _find_bframe(page)
-        if not bframe:
-            if DEBUG:
-                print("[CAPTCHA] bframe introuvable après clic audio")
-            return False
 
-        # ── Attendre l'apparition du challenge audio ──────────────────────────
-        for _ in range(15):
-            html = await bframe.evaluate("document.body.innerHTML")
-            if "rc-audiochallenge" in html or "audio-source" in html or ".mp3" in html or "payload" in html:
+        # ── Vérifier rate limit après clic ────────────────────────────────────
+        try:
+            err_el = challenge_frame.locator(".rc-audiochallenge-error-message")
+            if await err_el.is_visible(timeout=1500):
+                err_text = await err_el.text_content()
                 if DEBUG:
-                    print(f"[CAPTCHA] Audio challenge HTML détecté ({len(html)} chars)")
-                # Afficher la partie utile (hors token)
-                if DEBUG:
-                    # Trouver premier tag significatif
-                    idx = html.find("<div")
-                    snippet = html[idx:idx+2000] if idx >= 0 else html[:2000]
-                    print(f"[CAPTCHA] Snippet: {snippet}")
-                break
-            await page.wait_for_timeout(600)
-        else:
-            if DEBUG:
-                html = await bframe.evaluate("document.body.innerHTML")
-                idx = html.find("<div")
-                snippet = html[idx:idx+2000] if idx >= 0 else html[:2000]
-                print(f"[CAPTCHA] Challenge audio non détecté — bframe HTML:\n{snippet}")
-            return False
+                    print(f"[CAPTCHA] Rate limited: {err_text}")
+                return False
+        except Exception:
+            pass
 
-        # ── Récupérer l'URL audio ─────────────────────────────────────────────
-        audio_url = await bframe.evaluate("""
-            () => {
-                // Download link (le plus commun)
-                const dl = document.querySelector('.rc-audiochallenge-tdownload-link');
-                if (dl && dl.href) return dl.href;
-                // Audio element
-                const a = document.querySelector('audio');
-                if (a && a.src) return a.src;
-                const s = document.querySelector('audio source');
-                if (s && s.src) return s.src;
-                // Tout lien contenant 'payload' ou '.mp3'
-                for (const el of document.querySelectorAll('a[href]')) {
-                    if (el.href.includes('payload') || el.href.includes('.mp3')) return el.href;
-                }
-                return null;
-            }
-        """)
+        # Vérifier doscaptcha après clic
+        try:
+            dos = challenge_frame.locator(".rc-doscaptcha-body")
+            if await dos.is_visible(timeout=1500):
+                if DEBUG:
+                    print("[CAPTCHA] doscaptcha après clic audio — IP rate-limited")
+                return False
+        except Exception:
+            pass
+
+        # ── Récupérer l'URL audio via .rc-audiochallenge-tdownload-link ───────
+        try:
+            dl_link = challenge_frame.locator(".rc-audiochallenge-tdownload-link")
+            audio_url = await dl_link.get_attribute("href", timeout=5000)
+        except Exception:
+            audio_url = None
 
         if not audio_url:
             if DEBUG:
-                print("[CAPTCHA] Audio URL introuvable")
+                print("[CAPTCHA] Audio URL introuvable (.rc-audiochallenge-tdownload-link)")
             return False
 
         if DEBUG:
-            print(f"[CAPTCHA] Audio URL: {audio_url[:80]}...")
+            print(f"[CAPTCHA] Audio URL: {audio_url[:70]}...")
 
-        # ── Télécharger et transcrire avec Whisper ────────────────────────────
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-            tmp_path = tmp.name
-        urllib.request.urlretrieve(audio_url, tmp_path)
+        # ── Télécharger l'audio ───────────────────────────────────────────────
+        r = req_sync.get(audio_url, timeout=15)
+        r.raise_for_status()
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            f.write(r.content)
+            tmp_path = f.name
+        if DEBUG:
+            print(f"[CAPTCHA] Downloaded {len(r.content)} bytes")
 
-        model = whisper.load_model("tiny")
-        result = model.transcribe(tmp_path, language="en")
-        text = result["text"].strip().lower()
-        # reCAPTCHA audio = suite de chiffres séparés par des espaces
-        digits = "".join(c for c in text if c.isdigit() or c == " ").strip()
-        pathlib.Path(tmp_path).unlink(missing_ok=True)
+        # ── Transcrire avec faster-whisper (beam_size=5) ──────────────────────
+        model = WhisperModel("base", device="cpu", compute_type="int8")
+        segments, _ = model.transcribe(tmp_path, language="en", beam_size=5)
+        text = " ".join(seg.text for seg in segments).strip()
+        os.unlink(tmp_path)
+
+        # Nettoyer : garde alphanum + espaces, lowercase
+        text = "".join(c for c in text if c.isalnum() or c.isspace())
+        text = " ".join(text.split()).lower()
 
         if DEBUG:
-            print(f"[CAPTCHA] Whisper transcription: {text!r} → digits: {digits!r}")
+            print(f"[CAPTCHA] Transcription: {text!r}")
 
-        if not digits:
+        if not text:
             return False
 
-        # ── Entrer la réponse ─────────────────────────────────────────────────
-        # Essayer plusieurs sélecteurs connus pour le champ réponse audio
-        response_selectors = [
-            ".rc-audiochallenge-response-field",
-            "#audio-response",
-            "input[id*='audio']",
-            "input[type='text']",
-        ]
-        filled = False
-        for sel in response_selectors:
-            try:
-                await bframe.fill(sel, digits, timeout=3000)
-                filled = True
-                if DEBUG:
-                    print(f"[CAPTCHA] Filled answer in {sel!r}")
-                break
-            except Exception:
-                pass
-        if not filled:
-            if DEBUG:
-                print("[CAPTCHA] Impossible de remplir le champ réponse")
-            return False
-
-        await page.wait_for_timeout(300)
-        await bframe.click("#recaptcha-verify-button", timeout=5000)
+        # ── Soumettre la réponse ──────────────────────────────────────────────
+        await challenge_frame.locator("#audio-response").fill(text)
+        await challenge_frame.locator("#recaptcha-verify-button").click()
         await page.wait_for_timeout(2000)
 
+        # ── Vérifier la réussite (checkbox coché) ─────────────────────────────
+        try:
+            anchor_frame = page.frame_locator("iframe[src*='recaptcha'][src*='anchor']").first
+            checkmark = anchor_frame.locator(".recaptcha-checkbox-checked")
+            if await checkmark.is_visible(timeout=3000):
+                if DEBUG:
+                    print("[CAPTCHA] SOLVED!")
+                return True
+        except Exception:
+            pass
+
+        # Si le CAPTCHA est résolu, la page se soumet automatiquement
+        # On considère un succès si on n'a pas eu d'erreur
         if DEBUG:
-            print("[CAPTCHA] Answer submitted")
+            print("[CAPTCHA] Verify clicked — waiting for form submit...")
         return True
 
     except Exception as e:
         if DEBUG:
-            print(f"[CAPTCHA] Erreur bypass: {e}")
+            print(f"[CAPTCHA] Erreur: {e}")
         return False
 
 
@@ -316,8 +284,10 @@ async def _signin_playwright(email: str, password: str) -> dict[str, Any]:
     signin_data: dict[str, Any] = {}
 
     async with async_playwright() as p:
+        # capsolver: headless=False obligatoire — headless Chrome est détecté par reCAPTCHA
+        # Sur VPS sans display, utiliser: xvfb-run python3 passculture_checker.py ...
         browser = await p.chromium.launch(
-            headless=not VISIBLE,
+            headless=False,
             args=[
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
