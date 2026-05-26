@@ -91,6 +91,53 @@ class CheckResult:
 
 _LOGIN_PAGE = "https://passculture.app/connexion"
 
+# ── Browser fingerprint pool ──────────────────────────────────────────────────
+
+import random as _random
+
+_UA_POOL = [
+    # macOS Chrome (versions récentes)
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.6261.112 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    # Windows Chrome
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+]
+
+_VIEWPORT_POOL = [
+    {"width": 1280, "height": 800},
+    {"width": 1440, "height": 900},
+    {"width": 1920, "height": 1080},
+    {"width": 1366, "height": 768},
+    {"width": 1536, "height": 864},
+]
+
+
+def _pick_fingerprint() -> tuple[str, dict]:
+    """Retourne (user_agent, viewport) aléatoires depuis les pools."""
+    return _random.choice(_UA_POOL), _random.choice(_VIEWPORT_POOL)
+
+
+async def _human_move_click(page: Any, x: int, y: int) -> None:
+    """Déplace la souris en plusieurs étapes avant de cliquer (mouvement humain)."""
+    cur_x, cur_y = _random.randint(100, 400), _random.randint(100, 400)
+    steps = _random.randint(4, 8)
+    for i in range(1, steps + 1):
+        ix = cur_x + (x - cur_x) * i // steps + _random.randint(-3, 3)
+        iy = cur_y + (y - cur_y) * i // steps + _random.randint(-3, 3)
+        await page.mouse.move(ix, iy)
+        await page.wait_for_timeout(_random.randint(20, 60))
+    await page.mouse.click(x, y)
+
+
+def _rnd(base: int, variance: int = 0) -> int:
+    """Délai aléatoire centré sur base ± variance ms."""
+    spread = variance or max(10, base // 4)
+    return max(10, base + _random.randint(-spread, spread))
+
 
 def _get_google_cookies() -> list[dict]:
     """
@@ -231,7 +278,7 @@ async def _solve_recaptcha_audio(page: Any) -> bool:
 
         # ── Transcrire avec faster-whisper (beam_size=5) ──────────────────────
         model = WhisperModel("base", device="cpu", compute_type="int8")
-        segments, _ = model.transcribe(tmp_path, language="en", beam_size=5)
+        segments, _ = model.transcribe(tmp_path, language="fr", beam_size=5)  # passculture = fr-FR
         text = " ".join(seg.text for seg in segments).strip()
         os.unlink(tmp_path)
 
@@ -293,13 +340,13 @@ async def _signin_playwright(email: str, password: str) -> dict[str, Any]:
                 "--disable-dev-shm-usage",
             ],
         )
+        ua, viewport = _pick_fingerprint()
         ctx_kwargs: dict[str, Any] = {
-            "user_agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
+            "user_agent": ua,
             "locale": "fr-FR",
-            "viewport": {"width": 1280, "height": 800},
+            "viewport": viewport,
+            "color_scheme": "light",
+            "timezone_id": "Europe/Paris",
         }
         if USE_TOR:
             ctx_kwargs["proxy"] = {"server": "socks5://127.0.0.1:9050"}
@@ -330,14 +377,14 @@ async def _signin_playwright(email: str, password: str) -> dict[str, Any]:
             # ── Simulation humaine : visit home first (skip si Tor = lent) ─────
             if not USE_TOR:
                 await page.goto("https://passculture.app/", wait_until="domcontentloaded", timeout=nav_timeout)
-                await page.wait_for_timeout(1200)
-                await page.mouse.move(300, 300)
-                await page.wait_for_timeout(400)
-                await page.mouse.move(600, 400)
-                await page.wait_for_timeout(300)
+                await page.wait_for_timeout(_rnd(1200))
+                # Mouvement souris naturel sur la page d'accueil
+                vp = page.viewport_size or {"width": 1280, "height": 800}
+                await _human_move_click(page, _random.randint(200, vp["width"]//2), _random.randint(200, vp["height"]//2))
+                await page.wait_for_timeout(_rnd(400, 150))
 
             await page.goto(_LOGIN_PAGE, wait_until="domcontentloaded", timeout=nav_timeout)
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(_rnd(2000, 500))
 
             if DEBUG:
                 title = await page.title()
@@ -364,15 +411,20 @@ async def _signin_playwright(email: str, password: str) -> dict[str, Any]:
                 "document.querySelectorAll('div[tabindex=\"0\"]').forEach(el=>el.style.pointerEvents='none')"
             )
 
-            # Remplir email + password avec délais humains
+            # Remplir email + password avec délais humains aléatoires
             await page.evaluate("document.querySelector('input[type=\"email\"]').focus()")
-            await page.keyboard.type(email, delay=60)
-            await page.wait_for_timeout(350)
-            await page.mouse.move(500, 500)
-            await page.wait_for_timeout(200)
+            await page.keyboard.type(email, delay=_rnd(65, 25))
+            await page.wait_for_timeout(_rnd(380, 120))
+            # Petit mouvement de souris entre les champs (comportement humain)
+            vp = page.viewport_size or {"width": 1280, "height": 800}
+            await page.mouse.move(
+                _random.randint(400, vp["width"] - 100),
+                _random.randint(300, vp["height"] - 100),
+            )
+            await page.wait_for_timeout(_rnd(200, 80))
             await page.evaluate("document.querySelector('input[type=\"password\"]').focus()")
-            await page.keyboard.type(password, delay=55)
-            await page.wait_for_timeout(500)
+            await page.keyboard.type(password, delay=_rnd(60, 20))
+            await page.wait_for_timeout(_rnd(600, 200))
 
             if DEBUG:
                 ev = await page.evaluate("document.querySelector('input[type=\"email\"]').value")
@@ -380,15 +432,26 @@ async def _signin_playwright(email: str, password: str) -> dict[str, Any]:
                 print(f"[DEBUG] email='{ev}'  pwd_len={len(pv)}")
                 print("[DEBUG] Clicking Se connecter...")
 
-            # Cliquer "Se connecter"
-            await page.evaluate("""
-                () => {
-                    const b = Array.from(document.querySelectorAll('button'))
-                        .find(x => x.getAttribute('data-testid') === 'Se connecter'
-                               || /^Se connecter$/.test(x.textContent.trim()));
-                    if (b) b.click();
-                }
-            """)
+            # Cliquer "Se connecter" avec mouvement humain
+            btn = page.locator('[data-testid="Se connecter"]').first
+            try:
+                box = await btn.bounding_box(timeout=5000)
+                if box:
+                    cx = int(box["x"] + box["width"] / 2)
+                    cy = int(box["y"] + box["height"] / 2)
+                    await _human_move_click(page, cx, cy)
+                else:
+                    await btn.click(timeout=5000)
+            except Exception:
+                # Fallback JS click
+                await page.evaluate("""
+                    () => {
+                        const b = Array.from(document.querySelectorAll('button'))
+                            .find(x => x.getAttribute('data-testid') === 'Se connecter'
+                                   || /^Se connecter$/.test(x.textContent.trim()));
+                        if (b) b.click();
+                    }
+                """)
 
             # Attendre signin direct OU reCAPTCHA challenge
             captcha_appeared = False
