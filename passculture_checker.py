@@ -343,7 +343,7 @@ async def _signin_playwright(email: str, password: str) -> dict[str, Any]:
         ua, viewport = _pick_fingerprint()
         ctx_kwargs: dict[str, Any] = {
             "user_agent": ua,
-            "locale": "fr-FR",
+            "locale": "en-US",   # en-US → audio reCAPTCHA en anglais (transcription fiable)
             "viewport": viewport,
             "color_scheme": "light",
             "timezone_id": "Europe/Paris",
@@ -485,20 +485,31 @@ async def _signin_playwright(email: str, password: str) -> dict[str, Any]:
                     return {"status_code": 0, "data": {"error": "reCAPTCHA audio bypass failed"}}
                 await page.wait_for_timeout(1000)
 
-            # Intercepter la réponse signin
+            # Intercepter la réponse signin via listener (patchright compat)
+            signin_event = asyncio.Event()
+            captured: dict[str, Any] = {}
+
+            async def _on_response(resp: Any) -> None:
+                if "/native/v1/signin" in resp.url and resp.request.method == "POST":
+                    try:
+                        captured["status_code"] = resp.status
+                        captured["data"]        = await resp.json()
+                        if DEBUG:
+                            print(f"[DEBUG] /native/v1/signin → HTTP {resp.status}")
+                            print(f"[DEBUG] {json.dumps(captured['data'], ensure_ascii=False)[:1000]}")
+                    except Exception:
+                        pass
+                    finally:
+                        signin_event.set()
+
+            page.on("response", _on_response)
+            timeout_s = 30 if USE_TOR else 15
             try:
-                resp = await page.wait_for_response(
-                    lambda r: "/native/v1/signin" in r.url and r.request.method == "POST",
-                    timeout=30000 if USE_TOR else 15000,
-                )
-                body = await resp.json()
-                signin_data["status_code"] = resp.status
-                signin_data["data"]        = body
-                if DEBUG:
-                    print(f"[DEBUG] /native/v1/signin → HTTP {resp.status}")
-                    print(f"[DEBUG] {json.dumps(body, ensure_ascii=False)[:1000]}")
-            except PwTimeout:
+                await asyncio.wait_for(signin_event.wait(), timeout=timeout_s)
+            except asyncio.TimeoutError:
                 return {"status_code": 0, "data": {"error": "Signin response timeout"}}
+
+            signin_data = captured
 
         except PwTimeout as e:
             signin_data = {"status_code": 0, "data": {"error": f"Timeout: {e}"}}
